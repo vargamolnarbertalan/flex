@@ -34,7 +34,15 @@
     window.PlexPlayer.devlog('app:webOSRelaunch', { detail: JSON.stringify(e.detail || {}) });
     var testPlay = e.detail && e.detail.testPlay;
     var testOpenShow = e.detail && e.detail.testOpenShow;
-    if (testPlay) {
+    var testSeek = e.detail && e.detail.testSeek;
+    var testPause = e.detail && e.detail.testPause;
+    if (testSeek !== undefined && testSeek !== null) {
+      // Debug-only: exercises seekTo directly, since there's no way to
+      // simulate a physical remote's arrow-key press from here.
+      window.PlexPlayer.seekTo(Number(testSeek));
+    } else if (testPause) {
+      window.PlexPlayer.togglePause();
+    } else if (testPlay) {
       screen = 'player';
       listEl.style.display = 'none';
       gridEl.style.display = 'none';
@@ -305,6 +313,18 @@
     );
   }
 
+  // Plex's own "continue watching" position (ms). Skipped if there's
+  // nothing meaningful to resume (barely started) or if it's close enough
+  // to the end to count as finished -- avoids silently resuming into the
+  // last few seconds/credits instead of just starting over.
+  function resumeOffsetSeconds(item) {
+    var offsetMs = item.viewOffset || 0;
+    var durationMs = item.duration || 0;
+    if (offsetMs < 10000) return 0;
+    if (durationMs && durationMs - offsetMs < 60000) return 0;
+    return offsetMs / 1000;
+  }
+
   function startPlayback(item, part, sessionId, canDirectPlay) {
     // Normal remote-control use can't reach this with a session still active
     // (the player screen eats every key but Back, and Back already calls
@@ -320,15 +340,18 @@
     currentSessionId = sessionId;
     if (timelineInterval) { clearInterval(timelineInterval); timelineInterval = null; }
 
+    var startAtSeconds = resumeOffsetSeconds(item);
     if (canDirectPlay) {
       setStatus('Direct Play: ' + item.title);
-      window.PlexPlayer.playDirectUrl(window.PlexApi.directPlayUrl(part), item.title);
+      window.PlexPlayer.playDirectUrl(window.PlexApi.directPlayUrl(part), item.title, startAtSeconds, item.duration);
     } else {
       setStatus('Direct Stream/Transcode: ' + item.title);
       window.PlexPlayer.playDash(
         window.PlexApi.dashStartUrl(item, sessionId),
         window.PlexApi.dashSegmentBaseUrl(sessionId),
-        item.title
+        item.title,
+        startAtSeconds,
+        item.duration
       );
     }
     reportTick('playing');
@@ -455,7 +478,16 @@
       return;
     }
 
-    if (screen === 'player') return; // playback controls are Task 6; Back (above) is the only key here for now
+    if (screen === 'player') {
+      // Matches Plex Web's own skip amounts (confirmed by watching its real
+      // UI earlier this project): back 10s, forward 30s -- asymmetric on
+      // purpose, a forward skip (recap/intro) is more common than needing to
+      // rewind far.
+      if (e.key === 'Enter') { window.PlexPlayer.togglePause(); e.preventDefault(); }
+      else if (e.key === 'ArrowLeft') { window.PlexPlayer.seekRelative(-10); reportTick('playing'); e.preventDefault(); }
+      else if (e.key === 'ArrowRight') { window.PlexPlayer.seekRelative(30); reportTick('playing'); e.preventDefault(); }
+      return;
+    }
 
     if (screen === 'libraries') {
       // Panels sit in a left-to-right row now (used to be a vertical list,

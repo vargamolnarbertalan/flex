@@ -31,7 +31,32 @@
   var dashMediaSource = null;
   var dashObjectUrl = null;
   var dashTracks = null;
+  var dashSegmentSeconds = 3; // overwritten by the real MPD value once parsed
+  var dashSegmentBaseUrl = null;
+  var dashLabel = null;
+  var dashSeekGeneration = 0; // bumped on every seek; in-flight fetches from
+    // before a seek check this and silently drop their result instead of
+    // appending stale data at the wrong position once they resolve.
+  var dashPendingSeekTarget = null; // absolute content-seconds to seek
+    // videoEl.currentTime to once real data for it exists. Confirmed on real
+    // hardware (buffered-range devlog instrumentation): Plex's segments ARE
+    // timestamped with the true absolute position (requesting "segment 634"
+    // really does buffer content at ~634-635s, no -start_at_zero rebasing
+    // despite that flag appearing in the transcoder's own command line --
+    // an earlier theory here, wrong, left as a lesson in
+    // [[lgtv-plex-hls-ts-vs-dash]]). The actual bug: setting
+    // videoEl.currentTime while the SourceBuffers are still empty (no data
+    // buffered anywhere yet) gets silently clamped back to 0 -- there's no
+    // seekable range at all yet to seek within. Deferring the assignment
+    // until after real (non-init) data has landed for every track fixes it.
+  var knownDurationMs = 0; // Plex's own reported duration, passed in by the
+    // caller -- used as a fallback when the <video> element's own .duration
+    // isn't trustworthy yet (MSE reports it based on what's buffered so far,
+    // not the true total, until the last segment is appended).
   var listeners = [];
+
+  var overlayEl = null, overlayTimeEl = null, overlayFillEl = null;
+  var hideControlsTimer = null;
 
   function onEvent(cb) { listeners.push(cb); }
   function emit(evt, info) {
@@ -41,7 +66,11 @@
   }
 
   function getCurrentTime() { return videoEl ? videoEl.currentTime * 1000 : 0; }
-  function getDuration() { return videoEl ? videoEl.duration * 1000 : 0; }
+  function getDuration() {
+    var fromVideo = videoEl ? videoEl.duration * 1000 : 0;
+    if (fromVideo && isFinite(fromVideo)) return fromVideo;
+    return knownDurationMs;
+  }
 
   function ensureVideoEl() {
     if (videoEl) return videoEl;
@@ -75,17 +104,88 @@
           emit(evt, info);
         });
       });
+
+    ensureOverlay();
     return videoEl;
+  }
+
+  // ---- On-screen controls: time/progress only, shown briefly on input ----
+  // No third-party UI library -- a couple of divs, matching the rest of this
+  // app's plain-DOM approach. Driven by the video element's own native
+  // `timeupdate` event rather than a manual poll, so it tracks playback,
+  // pausing, and seeking for free with no extra timer.
+
+  function ensureOverlay() {
+    if (overlayEl) return;
+    overlayEl = document.createElement('div');
+    overlayEl.id = 'player-overlay';
+    overlayEl.className = 'player-overlay';
+
+    overlayTimeEl = document.createElement('div');
+    overlayTimeEl.className = 'player-overlay__time';
+    overlayEl.appendChild(overlayTimeEl);
+
+    var barOuter = document.createElement('div');
+    barOuter.className = 'player-overlay__bar';
+    overlayFillEl = document.createElement('div');
+    overlayFillEl.className = 'player-overlay__bar-fill';
+    barOuter.appendChild(overlayFillEl);
+    overlayEl.appendChild(barOuter);
+
+    document.body.appendChild(overlayEl);
+    videoEl.addEventListener('timeupdate', updateOverlay);
+  }
+
+  function formatTime(seconds) {
+    if (!isFinite(seconds) || seconds < 0) seconds = 0;
+    seconds = Math.floor(seconds);
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    var s = seconds % 60;
+    var mm = (h > 0 && m < 10 ? '0' : '') + m;
+    var ss = (s < 10 ? '0' : '') + s;
+    return h > 0 ? (h + ':' + mm + ':' + ss) : (m + ':' + ss);
+  }
+
+  function updateOverlay() {
+    if (!overlayEl || !videoEl) return;
+    var current = getCurrentTime() / 1000;
+    var duration = getDuration() / 1000;
+    overlayTimeEl.textContent = formatTime(current) + ' / ' + formatTime(duration);
+    var pct = duration > 0 ? Math.min(100, (current / duration) * 100) : 0;
+    overlayFillEl.style.width = pct + '%';
+  }
+
+  function showControls() {
+    if (!overlayEl) return;
+    updateOverlay();
+    overlayEl.classList.add('visible');
+    if (hideControlsTimer) clearTimeout(hideControlsTimer);
+    hideControlsTimer = setTimeout(function () {
+      if (overlayEl) overlayEl.classList.remove('visible');
+    }, 4000);
+  }
+
+  function hideControlsNow() {
+    if (hideControlsTimer) { clearTimeout(hideControlsTimer); hideControlsTimer = null; }
+    if (overlayEl) overlayEl.classList.remove('visible');
   }
 
   // ---- Direct Play: hand the browser the original file, untouched ----
 
-  function playDirectUrl(url, label) {
+  function playDirectUrl(url, label, startAtSeconds, durationMs) {
     var v = ensureVideoEl();
     teardownDash();
+    knownDurationMs = durationMs || 0;
     v.style.display = 'block';
-    devlog('play:direct:start', { label: label, url: url });
+    devlog('play:direct:start', { label: label, url: url, startAtSeconds: startAtSeconds || 0 });
     v.src = url;
+    if (startAtSeconds) {
+      v.addEventListener('loadedmetadata', function onMeta() {
+        v.removeEventListener('loadedmetadata', onMeta);
+        v.currentTime = startAtSeconds;
+      });
+    }
     v.load();
     var p = v.play();
     if (p && p.catch) {
@@ -93,6 +193,7 @@
         devlog('play:direct:play-rejected', { label: label, message: err && err.message });
       });
     }
+    showControls();
   }
 
   // ---- Direct Stream / Transcode fallback: DASH, fed to MSE by hand ----
@@ -113,6 +214,8 @@
 
   function teardownDash() {
     dashTracks = null;
+    dashPendingSeekTarget = null;
+    dashSeekGeneration++;
     if (dashMediaSource) {
       try { if (dashMediaSource.readyState === 'open') dashMediaSource.endOfStream(); } catch (e) {}
       dashMediaSource = null;
@@ -142,17 +245,35 @@
     return reps;
   }
 
-  function playDash(mpdUrl, segmentBaseUrl, label) {
+  // <SegmentTemplate timescale="1" duration="3" .../> -- segment length in
+  // seconds is duration/timescale. Needed for seeking (target segment index
+  // = floor(targetSeconds / segmentSeconds)); defaults to 3 (the value seen
+  // on every file tested so far) if parsing ever fails, rather than crashing.
+  function parseMpdSegmentSeconds(xmlText) {
+    var m = /<SegmentTemplate\b([^>]*)>/.exec(xmlText);
+    if (!m) return 3;
+    var duration = /\bduration="([^"]*)"/.exec(m[1]);
+    var timescale = /\btimescale="([^"]*)"/.exec(m[1]);
+    var d = duration ? parseFloat(duration[1]) : 3;
+    var t = timescale ? parseFloat(timescale[1]) : 1;
+    return (d > 0 && t > 0) ? (d / t) : 3;
+  }
+
+  function playDash(mpdUrl, segmentBaseUrl, label, startAtSeconds, durationMs) {
     var v = ensureVideoEl();
     teardownDash();
+    knownDurationMs = durationMs || 0;
+    dashSegmentBaseUrl = segmentBaseUrl;
+    dashLabel = label;
     v.style.display = 'block';
-    devlog('play:dash:start', { label: label, url: mpdUrl });
+    devlog('play:dash:start', { label: label, url: mpdUrl, startAtSeconds: startAtSeconds || 0 });
 
     withTimeoutFetch(mpdUrl, 8000).then(function (res) {
       if (!res.ok) throw new Error('mpd http ' + res.status);
       return res.text();
     }).then(function (xml) {
       var reps = parseMpdRepresentations(xml);
+      dashSegmentSeconds = parseMpdSegmentSeconds(xml);
       var videoRep = null, audioRep = null;
       reps.forEach(function (r) {
         if (!videoRep && r.mimeType.indexOf('video/') === 0) videoRep = r;
@@ -163,8 +284,8 @@
         emit('error', { reason: 'dash-no-representations' });
         return;
       }
-      devlog('dash:representations', { label: label, video: videoRep.codecs, audio: audioRep.codecs });
-      startDashPlayback(v, segmentBaseUrl, videoRep, audioRep, label);
+      devlog('dash:representations', { label: label, video: videoRep.codecs, audio: audioRep.codecs, segmentSeconds: dashSegmentSeconds });
+      startDashPlayback(videoRep, audioRep, startAtSeconds || 0);
     }).catch(function (err) {
       devlog('dash:mpd-failed', { label: label, message: err && err.message });
       emit('error', { reason: 'dash-mpd-failed' });
@@ -181,118 +302,224 @@
     return Promise.race([fetch(url), timer]);
   }
 
-  function startDashPlayback(v, segmentBaseUrl, videoRep, audioRep, label) {
+  function dashSegUrl(track, part) {
+    return dashSegmentBaseUrl + track.rep.id + '/' + part;
+  }
+
+  function dashLoadInit(track, generation) {
+    devlog('dash:init-fetch', { label: dashLabel, id: track.rep.id, url: dashSegUrl(track, 'header') });
+    withTimeoutFetch(dashSegUrl(track, 'header'), 8000).then(function (res) {
+      if (!res.ok) throw new Error('init http ' + res.status);
+      return res.arrayBuffer();
+    }).then(function (buf) {
+      if (generation !== dashSeekGeneration) return;
+      devlog('dash:init-fetched', { label: dashLabel, id: track.rep.id, bytes: buf.byteLength });
+      dashAppendThenContinue(track, buf, generation, 'init');
+    }).catch(function (err) {
+      if (generation !== dashSeekGeneration) return;
+      devlog('dash:init-failed', { label: dashLabel, id: track.rep.id, message: err && err.message });
+      emit('error', { reason: 'dash-init-failed' });
+    });
+  }
+
+  function dashAppendThenContinue(track, buf, generation, kind) {
+    if (dashTracks === null || generation !== dashSeekGeneration) return;
+    track.buf.addEventListener('updateend', function onDone() {
+      track.buf.removeEventListener('updateend', onDone);
+      if (generation !== dashSeekGeneration) return;
+      var bufferedDesc = '';
+      try {
+        var r = track.buf.buffered;
+        for (var i = 0; i < r.length; i++) bufferedDesc += '[' + r.start(i) + '-' + r.end(i) + ']';
+      } catch (e) { bufferedDesc = 'err:' + e.message; }
+      devlog('dash:appended', {
+        label: dashLabel, id: track.rep.id, kind: kind, buffered: bufferedDesc,
+        videoCurrentTime: videoEl.currentTime, videoReadyState: videoEl.readyState
+      });
+      if (kind !== 'init') {
+        track.gotFirstData = true;
+        if (dashPendingSeekTarget !== null && dashTracks.every(function (t) { return t.gotFirstData; })) {
+          var target = dashPendingSeekTarget;
+          dashPendingSeekTarget = null;
+          devlog('dash:apply-pending-seek', { label: dashLabel, target: target });
+          videoEl.currentTime = target;
+        }
+      }
+      dashFetchNextSegment(track, generation);
+    });
+    try {
+      track.buf.appendBuffer(buf);
+    } catch (e) {
+      devlog('dash:append-failed', { label: dashLabel, id: track.rep.id, kind: kind, message: e.message });
+      emit('error', { reason: 'dash-append-failed' });
+    }
+  }
+
+  function dashFetchNextSegment(track, generation) {
+    if (dashTracks === null || track.ended || generation !== dashSeekGeneration) return;
+    // Simple backpressure: a movie-length file fetched with no limit would
+    // sit entirely in memory ahead of playback. 30s/segment-count is a
+    // generous cushion for smooth playback without that.
+    var aheadSeconds = 0;
+    try {
+      var r = track.buf.buffered;
+      if (r.length) aheadSeconds = r.end(r.length - 1) - videoEl.currentTime;
+    } catch (e) {}
+    if (aheadSeconds > 30) {
+      setTimeout(function () { dashFetchNextSegment(track, generation); }, 1000);
+      return;
+    }
+    var n = track.nextSegment++;
+    devlog('dash:segment-fetch', { label: dashLabel, id: track.rep.id, n: n, url: dashSegUrl(track, n + '.m4s') });
+    withTimeoutFetch(dashSegUrl(track, n + '.m4s'), 8000).then(function (res) {
+      if (res.status === 404) { track.ended = true; dashMaybeEndStream(); return null; }
+      if (!res.ok) throw new Error('segment http ' + res.status);
+      track.retried = false;
+      return res.arrayBuffer();
+    }).then(function (buf) {
+      if (generation !== dashSeekGeneration) return;
+      if (buf) {
+        devlog('dash:segment-fetched', { label: dashLabel, id: track.rep.id, n: n, bytes: buf.byteLength });
+        dashAppendThenContinue(track, buf, generation, 'seg' + n);
+      }
+    }).catch(function (err) {
+      if (generation !== dashSeekGeneration) return;
+      // One retry for a transient LAN blip (seen in practice: fragLoadError-
+      // style repeated failures on an otherwise-fine file) before giving up.
+      if (!track.retried) {
+        track.retried = true;
+        track.nextSegment = n;
+        devlog('dash:segment-retry', { label: dashLabel, id: track.rep.id, n: n, message: err && err.message });
+        setTimeout(function () { dashFetchNextSegment(track, generation); }, 1000);
+        return;
+      }
+      devlog('dash:segment-failed', { label: dashLabel, id: track.rep.id, n: n, message: err && err.message });
+      emit('error', { reason: 'dash-segment-failed' });
+    });
+  }
+
+  function dashMaybeEndStream() {
+    if (!dashTracks || !dashTracks.every(function (t) { return t.ended; })) return;
+    try { if (dashMediaSource && dashMediaSource.readyState === 'open') dashMediaSource.endOfStream(); } catch (e) {}
+    devlog('dash:end-of-stream', { label: dashLabel });
+  }
+
+  function startDashPlayback(videoRep, audioRep, startAtSeconds) {
+    var v = videoEl;
     var videoMime = 'video/mp4; codecs="' + videoRep.codecs + '"';
     var audioMime = 'audio/mp4; codecs="' + audioRep.codecs + '"';
     if (!window.MediaSource || !MediaSource.isTypeSupported(videoMime) || !MediaSource.isTypeSupported(audioMime)) {
-      devlog('dash:unsupported-mime', { label: label, videoMime: videoMime, audioMime: audioMime });
+      devlog('dash:unsupported-mime', { label: dashLabel, videoMime: videoMime, audioMime: audioMime });
       emit('error', { reason: 'dash-unsupported-mime' });
       return;
     }
 
+    var generation = dashSeekGeneration;
     var ms = new MediaSource();
     dashMediaSource = ms;
     dashObjectUrl = URL.createObjectURL(ms);
     v.src = dashObjectUrl;
 
+    var startSegment = Math.max(0, Math.floor(startAtSeconds / dashSegmentSeconds));
+    dashPendingSeekTarget = startAtSeconds > 0 ? startAtSeconds : null;
+
     ms.addEventListener('sourceopen', function onOpen() {
       ms.removeEventListener('sourceopen', onOpen);
+      if (generation !== dashSeekGeneration) return; // torn down before this fired
       var videoBuf, audioBuf;
       try {
         videoBuf = ms.addSourceBuffer(videoMime);
         audioBuf = ms.addSourceBuffer(audioMime);
       } catch (e) {
-        devlog('dash:add-source-buffer-failed', { label: label, message: e.message });
+        devlog('dash:add-source-buffer-failed', { label: dashLabel, message: e.message });
         emit('error', { reason: 'dash-add-source-buffer-failed' });
         return;
       }
       dashTracks = [
-        { buf: videoBuf, rep: videoRep, nextSegment: 0, ended: false, retried: false },
-        { buf: audioBuf, rep: audioRep, nextSegment: 0, ended: false, retried: false }
+        { buf: videoBuf, rep: videoRep, nextSegment: startSegment, ended: false, retried: false, gotFirstData: false },
+        { buf: audioBuf, rep: audioRep, nextSegment: startSegment, ended: false, retried: false, gotFirstData: false }
       ];
-      dashTracks.forEach(function (track) { loadInit(track); });
+      dashTracks.forEach(function (track) { dashLoadInit(track, generation); });
     });
     v.load();
     var p = v.play();
     if (p && p.catch) {
-      p.catch(function (err) { devlog('play:dash:play-rejected', { label: label, message: err && err.message }); });
+      p.catch(function (err) { devlog('play:dash:play-rejected', { label: dashLabel, message: err && err.message }); });
     }
+    showControls();
+  }
 
-    function segUrl(track, part) {
-      return segmentBaseUrl + track.rep.id + '/' + part;
-    }
-
-    function loadInit(track) {
-      withTimeoutFetch(segUrl(track, 'header'), 8000).then(function (res) {
-        if (!res.ok) throw new Error('init http ' + res.status);
-        return res.arrayBuffer();
-      }).then(function (buf) {
-        appendThenContinue(track, buf);
-      }).catch(function (err) {
-        devlog('dash:init-failed', { label: label, id: track.rep.id, message: err && err.message });
-        emit('error', { reason: 'dash-init-failed' });
-      });
-    }
-
-    function appendThenContinue(track, buf) {
-      if (dashTracks === null) return; // torn down mid-flight
-      track.buf.addEventListener('updateend', function onDone() {
-        track.buf.removeEventListener('updateend', onDone);
-        fetchNextSegment(track);
-      });
+  // Random-access seek: bump the generation (so any in-flight fetch/append
+  // from before this point silently drops its result instead of landing at
+  // the wrong position once it resolves -- this device has no
+  // AbortController to cancel the underlying fetch outright), clear each
+  // track's buffered data, and resume fetching from the segment index
+  // covering the new target time. DASH's SourceBuffer "segments" mode (the
+  // default, left untouched) places each appended segment according to its
+  // own embedded timestamp, not append order, so jumping straight to an
+  // arbitrary segment number is enough -- no special-casing needed beyond
+  // that for this to land in the right place.
+  function seekDash(targetSeconds) {
+    if (!dashTracks) return;
+    dashSeekGeneration++;
+    var generation = dashSeekGeneration;
+    var targetSegment = Math.floor(targetSeconds / dashSegmentSeconds);
+    dashPendingSeekTarget = targetSeconds;
+    devlog('dash:seek', { label: dashLabel, targetSeconds: targetSeconds, targetSegment: targetSegment });
+    dashTracks.forEach(function (track) {
+      track.ended = false;
+      track.retried = false;
+      track.nextSegment = targetSegment;
+      track.gotFirstData = false; // need fresh post-seek data before the
+        // pending currentTime assignment is safe to apply (see dashAppendThenContinue)
+      try { if (track.buf.updating) track.buf.abort(); } catch (e) {}
+      var resume = function () { dashFetchNextSegment(track, generation); };
       try {
-        track.buf.appendBuffer(buf);
-      } catch (e) {
-        devlog('dash:append-failed', { label: label, id: track.rep.id, message: e.message });
-        emit('error', { reason: 'dash-append-failed' });
-      }
-    }
-
-    function fetchNextSegment(track) {
-      if (dashTracks === null || track.ended) return;
-      // Simple backpressure: a movie-length file fetched with no limit would
-      // sit entirely in memory ahead of playback. 30s/segment-count is a
-      // generous cushion for smooth playback without that.
-      var aheadSeconds = 0;
-      try {
-        var r = track.buf.buffered;
-        if (r.length) aheadSeconds = r.end(r.length - 1) - v.currentTime;
-      } catch (e) {}
-      if (aheadSeconds > 30) {
-        setTimeout(function () { fetchNextSegment(track); }, 1000);
-        return;
-      }
-      var n = track.nextSegment++;
-      withTimeoutFetch(segUrl(track, n + '.m4s'), 8000).then(function (res) {
-        if (res.status === 404) { track.ended = true; maybeEndStream(); return null; }
-        if (!res.ok) throw new Error('segment http ' + res.status);
-        track.retried = false;
-        return res.arrayBuffer();
-      }).then(function (buf) {
-        if (buf) appendThenContinue(track, buf);
-      }).catch(function (err) {
-        // One retry for a transient LAN blip (seen in practice: fragLoadError-
-        // style repeated failures on an otherwise-fine file) before giving up.
-        if (!track.retried) {
-          track.retried = true;
-          track.nextSegment = n;
-          devlog('dash:segment-retry', { label: label, id: track.rep.id, n: n, message: err && err.message });
-          setTimeout(function () { fetchNextSegment(track); }, 1000);
-          return;
+        var buffered = track.buf.buffered;
+        if (buffered.length) {
+          track.buf.addEventListener('updateend', function onCleared() {
+            track.buf.removeEventListener('updateend', onCleared);
+            if (generation === dashSeekGeneration) resume();
+          });
+          track.buf.remove(0, buffered.end(buffered.length - 1));
+        } else {
+          resume();
         }
-        devlog('dash:segment-failed', { label: label, id: track.rep.id, n: n, message: err && err.message });
-        emit('error', { reason: 'dash-segment-failed' });
-      });
-    }
+      } catch (e) {
+        resume();
+      }
+    });
+  }
 
-    function maybeEndStream() {
-      if (!dashTracks || !dashTracks.every(function (t) { return t.ended; })) return;
-      try { if (ms.readyState === 'open') ms.endOfStream(); } catch (e) {}
-      devlog('dash:end-of-stream', { label: label });
+  // ---- Shared playback controls: used by both Direct Play and DASH ----
+
+  function togglePause() {
+    if (!videoEl) return;
+    if (videoEl.paused) { videoEl.play(); } else { videoEl.pause(); }
+    showControls();
+  }
+
+  function seekTo(targetSeconds) {
+    if (!videoEl) return;
+    if (targetSeconds < 0) targetSeconds = 0;
+    var durationSeconds = getDuration() / 1000;
+    if (durationSeconds > 0 && targetSeconds > durationSeconds - 1) {
+      targetSeconds = Math.max(0, durationSeconds - 1);
     }
+    if (dashTracks) {
+      seekDash(targetSeconds);
+    } else {
+      videoEl.currentTime = targetSeconds;
+    }
+    showControls();
+  }
+
+  function seekRelative(deltaSeconds) {
+    seekTo(getCurrentTime() / 1000 + deltaSeconds);
   }
 
   function stop() {
+    hideControlsNow();
     teardownDash();
     if (videoEl) {
       videoEl.pause();
@@ -300,6 +527,7 @@
       try { videoEl.load(); } catch (e) {}
       videoEl.style.display = 'none';
     }
+    knownDurationMs = 0;
   }
 
   window.PlexPlayer = {
@@ -309,6 +537,10 @@
     devlog: devlog,
     onEvent: onEvent,
     getCurrentTime: getCurrentTime,
-    getDuration: getDuration
+    getDuration: getDuration,
+    togglePause: togglePause,
+    seekTo: seekTo,
+    seekRelative: seekRelative,
+    showControls: showControls
   };
 })();

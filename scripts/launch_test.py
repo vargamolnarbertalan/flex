@@ -6,6 +6,8 @@ behavior (different ratingKeys, same build) without a 20s+ reinstall each time.
 Usage:
     python scripts/launch_test.py <ratingKey>         # jump straight into playback
     python scripts/launch_test.py --show <ratingKey>  # open a show/season's children grid
+    python scripts/launch_test.py --seek <seconds>    # seek the currently-playing item
+    python scripts/launch_test.py --pause             # toggle pause on the currently-playing item
     python scripts/launch_test.py                     # relaunch with no params (normal boot)
 """
 import sys
@@ -22,6 +24,10 @@ def main():
     args = sys.argv[1:]
     if args and args[0] == "--show":
         launch_params = json.dumps({"testOpenShow": args[1]})
+    elif args and args[0] == "--seek":
+        launch_params = json.dumps({"testSeek": args[1]})
+    elif args and args[0] == "--pause":
+        launch_params = json.dumps({"testPause": True})
     elif args:
         launch_params = json.dumps({"testPlay": args[0]})
     else:

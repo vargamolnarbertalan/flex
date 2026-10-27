@@ -160,6 +160,44 @@
          thick inset border alone is already a clear, unambiguous focus
          indicator without that risk. */
     }
+
+    /* ---- Playback controls overlay (Task 6) ---- */
+    /* position: fixed, like the <video> element itself (player.js) -- sits
+       on top of it regardless of document flow/scroll state. Opacity-only
+       transition: cheap to animate (GPU composited, no layout/paint work),
+       same reasoning as avoiding box-shadow/backdrop-filter elsewhere in
+       this file. */
+    .player-overlay {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 10;
+      padding: 24px 96px 40px;
+      box-sizing: border-box;
+      background: linear-gradient(transparent, rgba(0, 0, 0, 0.85));
+      opacity: 0;
+      transition: opacity 0.2s;
+      pointer-events: none;
+    }
+    .player-overlay.visible { opacity: 1; }
+    .player-overlay__time {
+      color: var(--fg);
+      font-size: 26px;
+      margin-bottom: 14px;
+    }
+    .player-overlay__bar {
+      width: 100%;
+      height: 8px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.25);
+      overflow: hidden;
+    }
+    .player-overlay__bar-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+    }
   </style>
 </head>
 <body>
