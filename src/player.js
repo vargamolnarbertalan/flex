@@ -499,6 +499,22 @@
     showControls();
   }
 
+  // Separate from togglePause -- a remote's dedicated Play or Pause button
+  // (as opposed to a single combined Play/Pause button) means "definitely
+  // play" or "definitely pause", not "toggle". Using togglePause for these
+  // would pause an already-playing video when the user pressed Play.
+  function play() {
+    if (!videoEl) return;
+    videoEl.play();
+    showControls();
+  }
+
+  function pause() {
+    if (!videoEl) return;
+    videoEl.pause();
+    showControls();
+  }
+
   function seekTo(targetSeconds) {
     if (!videoEl) return;
     if (targetSeconds < 0) targetSeconds = 0;
@@ -539,6 +555,8 @@
     getCurrentTime: getCurrentTime,
     getDuration: getDuration,
     togglePause: togglePause,
+    play: play,
+    pause: pause,
     seekTo: seekTo,
     seekRelative: seekRelative,
     showControls: showControls

@@ -484,8 +484,27 @@
       // purpose, a forward skip (recap/intro) is more common than needing to
       // rewind far.
       if (e.key === 'Enter') { window.PlexPlayer.togglePause(); e.preventDefault(); }
-      else if (e.key === 'ArrowLeft') { window.PlexPlayer.seekRelative(-10); reportTick('playing'); e.preventDefault(); }
-      else if (e.key === 'ArrowRight') { window.PlexPlayer.seekRelative(30); reportTick('playing'); e.preventDefault(); }
+      // Dedicated remote media keys (Magic Remote play/pause/rewind cluster),
+      // separate from Enter -- standard KeyboardEvent.key values per the W3C
+      // media-key spec, which webOS's own remote-to-keyboard-event mapping
+      // follows. Play/Pause are deliberately NOT routed through togglePause:
+      // a dedicated Play button should always play, never pause something
+      // that's already playing just because the remote has one combined key
+      // on some models and two separate ones on others.
+      else if (e.key === 'MediaPlayPause') { window.PlexPlayer.togglePause(); e.preventDefault(); }
+      else if (e.key === 'MediaPlay') { window.PlexPlayer.play(); e.preventDefault(); }
+      else if (e.key === 'MediaPause') { window.PlexPlayer.pause(); e.preventDefault(); }
+      else if (e.key === 'ArrowLeft' || e.key === 'MediaRewind') { window.PlexPlayer.seekRelative(-10); reportTick('playing'); e.preventDefault(); }
+      else if (e.key === 'ArrowRight' || e.key === 'MediaFastForward') { window.PlexPlayer.seekRelative(30); reportTick('playing'); e.preventDefault(); }
+      else {
+        // Catch-all so an unhandled remote key (e.g. a physical Play/Pause
+        // button sending something other than the assumed MediaPlayPause/
+        // MediaPlay/MediaPause) shows up here instead of silently doing
+        // nothing -- can't simulate a real remote's dedicated media keys
+        // from the debug relaunch path, so this is the only way to see what
+        // a real button press actually sends without guessing again.
+        window.PlexPlayer.devlog('app:player:unhandled-key', { key: e.key, keyCode: e.keyCode });
+      }
       return;
     }
 
