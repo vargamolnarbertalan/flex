@@ -1,0 +1,12 @@
+{
+  "id": "com.lgtvtune.plexclient",
+  "version": "0.0.1",
+  "vendor": "My Company",
+  "type": "web",
+  "main": "index.html",
+  "title": "Flex",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "requiredACG": [],
+  "disableBackHistoryAPI": true
+}

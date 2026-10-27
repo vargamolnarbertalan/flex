@@ -1,0 +1,9 @@
+# Holds your real Plex token -- never commit this.
+config.local.js
+
+# Build output
+*.ipk
+
+# Editor/OS cruft
+.DS_Store
+Thumbs.db

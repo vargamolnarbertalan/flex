@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Flex</title>
+  <style>
+    /* Color tokens only -- no web fonts, no icon fonts, no CSS frameworks.
+       System sans-serif throughout; hierarchy comes from size/weight, which
+       costs nothing extra to render. Focus/selection effects below are the
+       same transform+outline approach already proven cheap on this device's
+       GPU (see the poster-grid focus style, unchanged), never box-shadow
+       blur or backdrop-filter -- both are expensive on this hardware and
+       buy nothing a flat outline doesn't already give here. */
+    :root {
+      --bg: #141414;
+      --bg-panel: #1d1d1d;
+      --fg: #f2f2f2;
+      --fg-dim: #a8a8a8;
+      --accent: #e5a00d;
+      --error: #ff8a80;
+    }
+    /* This app never intends to scroll the page itself -- it's a fixed
+       1920x1080 kiosk view, not a document. But a plain scrolling body makes
+       the header part of the same scrollable area as the grid below it, and
+       focusCard()'s scrollIntoView (genuinely needed once a library has more
+       rows than fit on screen) can end up scrolling the *whole page*,
+       taking the header with it -- confirmed on the real device, resetting
+       scroll position on every render didn't hold. Fix: html/body never
+       scroll at all; only #content-scroll does, in its own bounded box
+       below the header, which structurally can't ever drag the header along
+       with it regardless of focus/scroll timing. */
+    html, body { height: 100%; margin: 0; overflow: hidden; }
+    body {
+      padding: 54px 96px; /* 5% of 1080/1920 -- fixed TV viewport, computed not relative */
+      box-sizing: border-box;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: sans-serif;
+      font-size: 32px;
+      display: flex;
+      flex-direction: column;
+    }
+    #content-scroll {
+      flex: 1 1 auto;
+      min-height: 0; /* flex items default to min-height:auto, which can
+        otherwise refuse to shrink below content size and break the
+        overflow-y below -- a standard, old, well-supported flexbox fix */
+      overflow-y: auto;
+      overflow-x: hidden;
+      margin-top: 24px; /* an actual margin, not just the page's own edge
+        padding -- separates the header from scrollable content explicitly */
+    }
+    h1 {
+      margin: 0 0 24px;
+      font-size: 44px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      color: #141414;
+      background: var(--accent);
+      display: inline-block;
+      padding: 8px 24px;
+      border-radius: 8px;
+      /* Solid badge, not gold-text-on-black -- temporary diagnostic too:
+         if this doesn't show up top-left at all, the top padding/layout has
+         a real bug, not just a legibility problem with thin text in a photo. */
+    }
+    .status { color: var(--fg-dim); font-size: 22px; }
+    .status--error { color: var(--error); }
+
+    /* ---- Home screen: one big panel per library ---- */
+    /* Flexbox, not CSS Grid -- see the poster-grid comment below, same
+       Chromium-53 constraint applies here too. */
+    #libraries {
+      display: flex;
+      flex-wrap: wrap;
+    }
+    .panel {
+      cursor: pointer;
+      width: 820px;
+      height: 420px;
+      margin-bottom: 40px;
+      border-radius: 12px;
+      background: var(--bg-panel);
+      border: 2px solid #2a2a2a;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 0 0 48px 48px;
+      box-sizing: border-box;
+    }
+    /* Gap only *between* panels, not a trailing margin on every one --
+       content width is 1920 - 2*96 = 1728px; two 820px panels need exactly
+       one 40px gap (1680px), not two (1760px, which doesn't fit and was
+       silently wrapping them onto separate rows). */
+    .panel:not(:last-child) { margin-right: 40px; }
+    .panel__title {
+      font-size: 56px;
+      font-weight: 700;
+      line-height: 1.15;
+    }
+    .panel__type {
+      margin-top: 8px;
+      font-size: 24px;
+      color: var(--fg-dim);
+      text-transform: uppercase;
+      letter-spacing: 2px;
+    }
+    /* .panel.focused shares the focus ring with .card.focused img below --
+       one visual language for "this is selected" app-wide. Don't diverge
+       the two without being asked; see the standard-focus-ring feedback
+       memory for why. */
+    .panel.focused {
+      outline: 8px solid var(--accent);
+      outline-offset: -8px;
+    }
+
+    /* Flexbox + fixed pixel sizes, not CSS Grid -- this TV's Chromium 53
+       (2016) predates CSS Grid (Chrome 57) and the aspect-ratio property
+       (Chrome 88). Setting style.display='grid' on an engine that doesn't
+       recognize the value is silently rejected, so the container never
+       actually left display:none even though the images inside it had
+       already loaded -- confirmed on the real device, not theoretical.
+       flex-wrap also predates `gap` support on flex containers (~Chrome 84),
+       so spacing is margins, not gap. 5 columns, matches GRID_COLUMNS in
+       app.js -- fixed 1920px viewport, so fixed pixel widths instead of
+       percentages is fine and sidesteps another whole class of this bug. */
+    #grid {
+      display: none;
+      flex-wrap: wrap;
+    }
+    .card {
+      cursor: pointer;
+      width: 300px;
+      margin: 0 20px 28px 0;
+    }
+    .card img {
+      width: 300px;
+      height: 450px;
+      object-fit: cover;
+      border-radius: 6px;
+      display: block;
+      background: #2a2a2a; /* visible while the poster loads */
+    }
+    .card__title {
+      font-size: 22px;
+      margin-top: 8px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .card.focused img {
+      outline: 8px solid var(--accent);
+      outline-offset: -8px; /* inset, not outset -- an outer ring at 1.04x
+        scale reached down into the title text below; negative offset pulls
+        it inside the image's own edge instead. Thickened from 5 to 8px --
+        reported as not visible enough at 5px against varied poster art. */
+      /* No scale transform -- it grows the box from its center, so the top
+         row's top edge (border included) pushed past #content-scroll's own
+         top boundary with nowhere to scroll into, and got clipped. The
+         thick inset border alone is already a clear, unambiguous focus
+         indicator without that risk. */
+    }
+  </style>
+</head>
+<body>
+  <h1>Flex</h1>
+  <p id="status" class="status"></p>
+  <div id="content-scroll">
+    <div id="libraries"></div>
+    <div id="grid"></div>
+  </div>
+  <script src="webOSTVjs-1.2.13/webOSTV.js"></script>
+  <script src="src/config.js"></script>
+  <script src="config.local.js"></script>
+  <script src="src/plex-api.js"></script>
+  <script src="src/player.js"></script>
+  <script src="src/app.js"></script>
+</body>
+</html>

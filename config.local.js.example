@@ -1,0 +1,6 @@
+// Copy this file to config.local.js and fill in real values.
+// Get these by running: python scripts/get-plex-token.py
+window.PLEX_SECRETS = {
+  token: "PASTE_YOUR_PLEX_TOKEN",
+  clientId: "PASTE_A_RANDOM_UUID"
+};
